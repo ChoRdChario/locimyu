@@ -246,7 +246,7 @@
 
   async function ensureSheetNameRegistrySheet(spreadsheetId) {
   if (!spreadsheetId) return null;
-  const exist = await findSheetByTitle(spreadsheetId, REGISTRY_SHEET_TITLE);
+  const exist = await findSheetByTitle(spreadsheetId, SHEET_NAME_REGISTRY_TITLE);
   if (exist) return exist;
   if (isShareMode()) {
     return null;
