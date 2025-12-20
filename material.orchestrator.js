@@ -20,6 +20,11 @@
   // Cache: sheetGid -> Map<materialKey, PropsObject>
   const sheetMaterialCache = new Map();
 
+  // share / edit 共通: 直近の読み込み結果を保持して、GLB読込後に再適用できるようにする
+  let lastSheetCtx = null;
+  let lastLoadedMap = null;
+  let pendingAuthRetry = false;
+
   const defaultProps = {
     opacity: 1,
     doubleSided: false,
@@ -259,7 +264,8 @@
   // --- Data Loading from __LM_MATERIALS ---
 
   async function loadMaterialsForContext(spreadsheetId, sheetGid) {
-    if (!spreadsheetId || !sheetGid) return;
+    // NOTE: sheetGid can be 0 for the first sheet. Treat 0 as a valid gid.
+    if (!spreadsheetId || sheetGid == null || sheetGid === '') return;
     const fetchJSON = window.__lm_fetchJSONAuth;
     if (!fetchJSON) {
       console.warn(LOG_PREFIX, 'No auth fetch available; cannot load materials');
@@ -386,32 +392,50 @@
 
   async function handleSheetContextChange(ctx) {
     const spreadsheetId = ctx && ctx.spreadsheetId;
-    const sheetGid = ctx && ctx.sheetGid;
-    currentSheetGid = sheetGid ? String(sheetGid) : '';
+    // IMPORTANT: Google Sheets' first sheet gid is often 0.
+    // Avoid truthy/falsy checks that would drop gid=0.
+    const sheetGid = ctx && (Object.prototype.hasOwnProperty.call(ctx, 'sheetGid') ? ctx.sheetGid : (ctx.defaultCaptionGid ?? ctx.activeSheetGid));
+    currentSheetGid = (sheetGid == null || sheetGid === '') ? '' : String(sheetGid);
 
     console.log(LOG_PREFIX, 'Sheet Context Change ->', currentSheetGid);
 
-    if (!spreadsheetId || !currentSheetGid) return;
+    if (!spreadsheetId || currentSheetGid === '') return;
 
-    const map = await loadMaterialsForContext(spreadsheetId, currentSheetGid);
-    console.log(LOG_PREFIX, 'Data Loaded. Keys:', map ? map.size : 0, 'for sheet', currentSheetGid);
+    // 直近のコンテキストを保持（GLB読み込み順の揺れに備える）
+    lastSheetCtx = ctx;
 
-    if (!ui) ui = queryUI();
-    if (ui && ui.materialSelect && ui.materialSelect.value) {
-      // 既に選択されているマテリアルがあれば、その状態を優先して同期
-      syncMaterialState(ui.materialSelect.value);
-    } else if (map && map.size) {
-      const firstKey = map.keys().next().value;
-      if (firstKey && ui && ui.materialSelect) {
-        ui.materialSelect.value = firstKey;
+    try {
+      const map = await loadMaterialsForContext(spreadsheetId, currentSheetGid);
+      lastLoadedMap = map;
+
+      if (!ui) ui = queryUI();
+
+      // 重要: UIで選択されている1件だけでなく、全マテリアルに一括で反映する
+      if (lastLoadedMap && lastLoadedMap.size > 0) {
+        applyAllToScene(lastLoadedMap);
       }
-      applyAllToScene(map);
-    } else {
-      applyAllToScene(new Map());
+
+      // UIは「現在選択中のマテリアル」に同期（未選択なら先頭を選択）
+      if (ui && ui.materialSelect) {
+        let key = ui.materialSelect.value;
+        if ((!key || key === 'Select material...' || key === 'Select...') && lastLoadedMap && lastLoadedMap.size > 0) {
+          key = lastLoadedMap.keys().next().value;
+          ui.materialSelect.value = key;
+        }
+        if (key) syncMaterialState(key);
+      }
+
+      pendingAuthRetry = false;
+    } catch (e) {
+      console.warn(LOG_PREFIX, 'Failed to load materials for ctx (will retry on signin if needed)', e);
+
+      // 401/403 は「サインイン未完了」や「権限不足」の可能性が高いので、サインイン後に再試行する
+      const msg = String(e && (e.message || e));
+      if (/(401|403)/.test(msg)) pendingAuthRetry = true;
     }
   }
 
-  // --- Direct DOM Event Binding ---
+
 
   function bindDirectEvents() {
     if (listenersBound) return;
@@ -507,6 +531,22 @@
     window.addEventListener('lm:sheet-context', (e) => {
       if (e.detail) handleSheetContextChange(e.detail);
     });
+    // GLB読込後にマテリアル状態が上書きされるケースがあるため、読込完了イベントで再適用する
+    window.addEventListener('lm:glb-loaded', () => {
+      if (lastLoadedMap && lastLoadedMap.size > 0) {
+        // 1tick遅らせて viewer/materials の初期化完了を待つ
+        setTimeout(() => applyAllToScene(lastLoadedMap), 0);
+      }
+    });
+
+    // サインイン完了がコンテキスト/シート読込より後になる場合に備えて、401/403時は再試行
+    window.addEventListener('lm:signin-ok', () => {
+      if (pendingAuthRetry && lastSheetCtx) {
+        pendingAuthRetry = false;
+        handleSheetContextChange(lastSheetCtx);
+      }
+    });
+
     if (window.__LM_SHEET_CTX) {
       handleSheetContextChange(window.__LM_SHEET_CTX);
     }
